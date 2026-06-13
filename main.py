@@ -16,7 +16,12 @@ async def lifespan(app: FastAPI):
     data_dir = Path(__file__).parent
     
     for file_path in data_dir.glob("*.parquet"):
-        season_key = file_path.stem.split("_", 1)[1] 
+        # If filename is 'nba_2025_26_gamelogs' -> parts will be ['nba', '2025', '26', 'gamelogs']
+        parts = file_path.stem.split("_")
+        
+        # Grab just the year segments and join them with an underscore
+        season_key = f"{parts[1]}_{parts[2]}"  # Results in '2025_26'
+        
         season_data[season_key] = pd.read_parquet(file_path)
         print(f"Loaded {season_key}: {len(season_data[season_key])} rows.")
         
@@ -318,7 +323,8 @@ async def calculate_precision_auction_values(season: str, config: PrecisionAucti
     ).reset_index()
     
     # --- STEP 5: PURE ECONOMIC AUCTION VALUATION ---
-    total_league_vorp = final_player_pool['total_accumulated_vorp'].sum()
+    top_players_vorp = final_player_pool.head(rep_index)['total_accumulated_vorp']
+    total_league_vorp = top_players_vorp.sum()
     total_league_cash_pool = config.num_teams * config.total_budget_per_team
     
     # Direct proportional distribution without artificial baseline floors
