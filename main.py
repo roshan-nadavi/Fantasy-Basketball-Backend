@@ -1,5 +1,6 @@
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
+import numpy as np
 from pydantic import BaseModel, field_validator
 from datetime import date
 import pandas as pd
@@ -229,15 +230,36 @@ async def calculate_precision_auction_values(season: str, config: PrecisionAucti
         raise HTTPException(status_code=404, detail=f"Season '{season}' not found")
         
     df = season_data[season].copy()
-    
-    # --- STEP 1: WEEKLY MATCHUP SEGMENTATION ---
     df['GAME_DATE'] = pd.to_datetime(df['GAME_DATE'])
-    anchor_date = df['GAME_DATE'].min()
     
-    df['days_elapsed'] = (df['GAME_DATE'] - anchor_date).dt.days
-    df['week_number'] = (df['days_elapsed'] // 7) + 1
+    # 1. Align with the Monday anchor
+    first_game_date = df['GAME_DATE'].min()
+    days_to_subtract = first_game_date.weekday() 
+    monday_anchor = first_game_date - pd.Timedelta(days=days_to_subtract)
     
-    # Filter for the active fantasy timeline
+    # 2. Calculate the actual calendar week (7-day intervals)
+    df['days_since_monday_anchor'] = (df['GAME_DATE'] - monday_anchor).dt.days
+    df['calendar_week'] = (df['days_since_monday_anchor'] // 7) + 1
+    
+    # 3. Map Calendar Weeks to Fantasy Weeks to handle the 14-day All-Star Week
+    # We use np.select to apply conditional routing to the entire column at once
+    conditions = [
+        df['calendar_week'] <= 16,                         # Before All-Star Break
+        df['calendar_week'].isin([17, 18]),                # The 14-day All-Star Week combo
+        df['calendar_week'] > 18                           # Post All-Star Break
+    ]
+    
+    choices = [
+        df['calendar_week'],                               # Keep 1-16 exactly as is
+        17,                                                # Force both 17 and 18 into Fantasy Week 17
+        df['calendar_week'] - 1                            # Shift later weeks down by 1 to compress
+    ]
+    
+    # Assign the final compressed fantasy week numbers
+    df['week_number'] = np.select(conditions, choices, default=1)
+    
+    # 4. Filter for your total active fantasy timeline
+    # 20 regular weeks + playoff_weeks (e.g., 4) = 24 total fantasy weeks
     total_fantasy_weeks = config.regular_weeks + config.playoff_weeks
     df = df[df['week_number'] <= total_fantasy_weeks]
     
