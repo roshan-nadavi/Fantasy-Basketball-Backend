@@ -247,24 +247,21 @@ async def calculate_precision_auction_values(season: str, config: PrecisionAucti
     df['calendar_week'] = (df['days_since_monday_anchor'] // 7) + 1
     
     # 3. Map Calendar Weeks to Fantasy Weeks to handle the 14-day All-Star Week
-    # We use np.select to apply conditional routing to the entire column at once
     conditions = [
-        df['calendar_week'] <= 16,                         # Before All-Star Break
-        df['calendar_week'].isin([17, 18]),                # The 14-day All-Star Week combo
-        df['calendar_week'] > 18                           # Post All-Star Break
+        df['calendar_week'] <= 16,
+        df['calendar_week'].isin([17, 18]),
+        df['calendar_week'] > 18
     ]
     
     choices = [
-        df['calendar_week'],                               # Keep 1-16 exactly as is
-        17,                                                # Force both 17 and 18 into Fantasy Week 17
-        df['calendar_week'] - 1                            # Shift later weeks down by 1 to compress
+        df['calendar_week'],
+        17,
+        df['calendar_week'] - 1
     ]
     
-    # Assign the final compressed fantasy week numbers
     df['week_number'] = np.select(conditions, choices, default=1)
     
     # 4. Filter for your total active fantasy timeline
-    # 20 regular weeks + playoff_weeks (e.g., 4) = 24 total fantasy weeks
     total_fantasy_weeks = config.regular_weeks + config.playoff_weeks
     df = df[df['week_number'] <= total_fantasy_weeks]
     
@@ -279,42 +276,35 @@ async def calculate_precision_auction_values(season: str, config: PrecisionAucti
     )
     
     # --- STEP 2: WEEKLY PLAYER SUMMATION ---
-    # Aggregate points per player, PER WEEK
     weekly_player_stats = df.groupby(
         ['week_number', 'PLAYER_ID', 'PLAYER_NAME', 'TEAM_ABBREVIATION']
     )['final_fp'].sum().reset_index()
     
     # --- STEP 3: DYNAMIC WEEKLY REPLACEMENT BASES ---
-    # Determine how many players are starting across the league each week
-    replacement_rank = config.num_teams * config.roster_size
-    
+    total_draftable_slots = config.num_teams * config.roster_size
     weekly_vorp_list = []
     
-    # Loop through each individual week to find its unique replacement baseline
     for week in range(1, total_fantasy_weeks + 1):
         week_df = weekly_player_stats[weekly_player_stats['week_number'] == week].copy()
         
         if week_df.empty:
             continue
             
-        # Sort top scorers down to lowest scorers for this specific week
         week_df = week_df.sort_values(by='final_fp', ascending=False).reset_index(drop=True)
         
         # Identify the boundary baseline score for this week
-        rep_index = min(replacement_rank, len(week_df) - 1)
+        rep_index = min(total_draftable_slots, len(week_df) - 1)
         replacement_baseline_score = week_df.loc[rep_index, 'final_fp']
         
-        # CRITICAL CHANGE: Calculate VORP and enforce the lower bound floor of 0
+        # Calculate weekly VORP and enforce the lower bound floor of 0
         week_df['weekly_vorp'] = week_df['final_fp'] - replacement_baseline_score
         week_df['weekly_vorp'] = week_df['weekly_vorp'].clip(lower=0)
         
         weekly_vorp_list.append(week_df)
     
-    # Merge all processed weeks back into one contiguous table
     processed_weekly_df = pd.concat(weekly_vorp_list, ignore_index=True)
     
     # --- STEP 4: SEASONAL AGGREGATION OF WEEKLY VALUE ---
-    # Sum up the non-negative weekly VORP metrics for every player
     final_player_pool = processed_weekly_df.groupby(
         ['PLAYER_ID', 'PLAYER_NAME', 'TEAM_ABBREVIATION']
     ).agg(
@@ -322,23 +312,45 @@ async def calculate_precision_auction_values(season: str, config: PrecisionAucti
         total_accumulated_vorp=('weekly_vorp', 'sum')
     ).reset_index()
     
-    # --- STEP 5: PURE ECONOMIC AUCTION VALUATION ---
-    top_players_vorp = final_player_pool.head(rep_index)['total_accumulated_vorp']
-    total_league_vorp = top_players_vorp.sum()
-    total_league_cash_pool = config.num_teams * config.total_budget_per_team
+    # --- STEP 4b: CRITICAL RETROACTIVE SEASONAL BASELINE ADJUSTMENT ---
+    # 1. Sort by total accumulated VORP descending to find the draftable boundary
+    final_player_pool = final_player_pool.sort_values(by='total_accumulated_vorp', ascending=False).reset_index(drop=True)
     
-    # Direct proportional distribution without artificial baseline floors
+    # 2. Find the exact VORP score of the replacement_rank player (e.g. index 129 for a 130-player league)
+    boundary_index = min(total_draftable_slots - 1, len(final_player_pool) - 1)
+    seasonal_replacement_vorp = final_player_pool.loc[boundary_index, 'total_accumulated_vorp']
+    
+    # 3. Subtract that boundary VORP from EVERY player, and clip at 0
+    # This guarantees the replacement player hits EXACTLY 0, and anyone below them drops to 0
+    final_player_pool['adjusted_vorp'] = final_player_pool['total_accumulated_vorp'] - seasonal_replacement_vorp
+    final_player_pool['adjusted_vorp'] = final_player_pool['adjusted_vorp'].clip(lower=0)
+    
+    # --- STEP 5: LINEAR RESTRICTED-POOL ECONOMIC VALUATION ---
+    total_league_cash_pool = config.num_teams * config.total_budget_per_team
+
+    # Isolate only the top drafted tier to compute the clean market denominator
+    top_drafted_df = final_player_pool.head(total_draftable_slots).copy()
+    total_league_vorp = top_drafted_df['adjusted_vorp'].sum()
+
+    # Reserve $1.00 minimum for every single drafted slot
+    mandatory_roster_cost = total_draftable_slots * 1.0
+    premium_bidding_pool = total_league_cash_pool - mandatory_roster_cost
+
+    # Initialize the whole pool's values to $0.00
+    final_player_pool['auction_value'] = 0.0
+
+    # Distribute premium capital based on the linear adjusted VORP share
     if total_league_vorp > 0:
-        final_player_pool['auction_value'] = (
-            final_player_pool['total_accumulated_vorp'] / total_league_vorp
-        ) * total_league_cash_pool
+        premium_values = (top_drafted_df['adjusted_vorp'] / total_league_vorp) * premium_bidding_pool
+        final_player_pool.loc[:total_draftable_slots - 1, 'auction_value'] = 1.0 + premium_values
     else:
-        final_player_pool['auction_value'] = 0.0
+        final_player_pool.loc[:total_draftable_slots - 1, 'auction_value'] = 1.0
         
-    # Formatting adjustments for frontend presentation
+    # Final formatting adjustments
     final_player_pool = final_player_pool.sort_values(by='auction_value', ascending=False).reset_index(drop=True)
     final_player_pool['auction_value'] = final_player_pool['auction_value'].round(2)
     final_player_pool['total_weighted_points'] = final_player_pool['total_weighted_points'].round(2)
     final_player_pool['total_accumulated_vorp'] = final_player_pool['total_accumulated_vorp'].round(2)
+    final_player_pool['adjusted_vorp'] = final_player_pool['adjusted_vorp'].round(2)
     
     return final_player_pool.to_dict(orient="records")
