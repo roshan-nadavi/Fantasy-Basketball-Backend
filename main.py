@@ -1,10 +1,10 @@
 from fastapi import FastAPI, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
-from pydantic import BaseModel
+from pydantic import BaseModel, field_validator
+from datetime import date
 import pandas as pd
 from pathlib import Path
 from contextlib import asynccontextmanager
-from typing import List
 
 # Global dictionary to hold multiple seasons
 season_data = {}
@@ -21,12 +21,13 @@ async def lifespan(app: FastAPI):
         
     yield
     season_data.clear()
+
 app = FastAPI(lifespan=lifespan)
 
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
-    allow_methods=["POST"],
+    allow_methods=["POST", "OPTIONS"],
     allow_headers=["*"],
 )
 
@@ -53,10 +54,11 @@ class ScoringWeights(BaseModel):
     TOV: float = -1.0
     PF: float = 0.0
     PTS: float = 1.0
-@app.post("/{season}/players/fantasy-scores")
-def get_fantasy_scores(season: str, weights: ScoringWeights):
-    global season_data
 
+
+# Endpoint 1: All players fantasy scores for a season
+@app.post("/{season}/players/fantasy-scores")
+def get_fantasy_scores(season: str, weights: ScoringWeights, limit: int = 50, offset: int = 0):
     if season not in season_data:
         raise HTTPException(status_code=404, detail="Season data not found")
         
@@ -81,34 +83,51 @@ def get_fantasy_scores(season: str, weights: ScoringWeights):
     grouped = grouped.sort_values(by='total_fantasy_pts', ascending=False)
     grouped['total_fantasy_pts'] = grouped['total_fantasy_pts'].round(2)
     grouped['avg_fantasy_pts'] = grouped['avg_fantasy_pts'].round(2)
-    
-    return grouped.to_dict(orient="records")
 
-# 1. New Request Model combining Dates and Weights
+    paginated = grouped.iloc[offset: offset + limit]
+    return {
+        "total": len(grouped),
+        "offset": offset,
+        "limit": limit,
+        "data": paginated.to_dict(orient="records")
+    }
+
+
+# Endpoint 2: All players fantasy scores for a season filtered by date range
 class DateRangeScoringRequest(BaseModel):
     start_date: str  # Expected format: "YYYY-MM-DD"
     end_date: str    # Expected format: "YYYY-MM-DD"
     weights: ScoringWeights
 
-# 2. New Filtered Endpoint
-@app.post("/{season}/players/fantasy-scores/date-range")
-def get_fantasy_scores_by_date(season: str, req: DateRangeScoringRequest):
-    global season_data
+    @field_validator('start_date', 'end_date')
+    @classmethod
+    def validate_date(cls, v):
+        try:
+            date.fromisoformat(v)
+        except ValueError:
+            raise ValueError(f"Invalid date format '{v}'. Expected YYYY-MM-DD.")
+        return v
 
+    @field_validator('end_date')
+    @classmethod
+    def end_after_start(cls, v, info):
+        if 'start_date' in info.data and v < info.data['start_date']:
+            raise ValueError("end_date must be on or after start_date.")
+        return v
+
+@app.post("/{season}/players/fantasy-scores/date-range")
+def get_fantasy_scores_by_date(season: str, req: DateRangeScoringRequest, limit: int = 50, offset: int = 0):
     if season not in season_data:
         raise HTTPException(status_code=404, detail="Season data not found")
         
     df_logs = season_data[season]
     
-    # 3. Filter by Date Range First (Reduces rows to process)
-    # Pandas handles ISO string comparisons ("YYYY-MM-DD") natively and quickly
     date_mask = (df_logs['GAME_DATE'] >= req.start_date) & (df_logs['GAME_DATE'] <= req.end_date)
     df_filtered = df_logs[date_mask].copy()
     
     if df_filtered.empty:
-        return [] # Return empty list gracefully if no games happened in this range
+        return {"total": 0, "offset": offset, "limit": limit, "data": []}
 
-    # 4. Compute Vectorized Math on the filtered subset
     w = req.weights.model_dump()
     custom_scores = pd.Series(0.0, index=df_filtered.index)
     
@@ -116,27 +135,30 @@ def get_fantasy_scores_by_date(season: str, req: DateRangeScoringRequest):
         if weight != 0 and stat in df_filtered.columns:
             custom_scores += df_filtered[stat] * weight
             
-    # Assign to the local dataframe copy to protect global state integrity
     df_filtered['CUSTOM_FP'] = custom_scores
     
-    # 5. Group and Aggregate
     grouped = df_filtered.groupby(['PLAYER_ID', 'PLAYER_NAME', 'TEAM_ABBREVIATION']).agg(
         games_played=('GAME_ID', 'count'),
         total_fantasy_pts=('CUSTOM_FP', 'sum'),
         avg_fantasy_pts=('CUSTOM_FP', 'mean')
     ).reset_index()
     
-    # 6. Format and Sort Output
     grouped = grouped.sort_values(by='total_fantasy_pts', ascending=False)
     grouped['total_fantasy_pts'] = grouped['total_fantasy_pts'].round(2)
     grouped['avg_fantasy_pts'] = grouped['avg_fantasy_pts'].round(2)
-    
-    return grouped.to_dict(orient="records")
 
+    paginated = grouped.iloc[offset: offset + limit]
+    return {
+        "total": len(grouped),
+        "offset": offset,
+        "limit": limit,
+        "data": paginated.to_dict(orient="records")
+    }
+
+
+# Endpoint 3: All games for a specific player in a season with fantasy scores
 @app.post("/{season}/player/{player_id}/games")
 def get_player_games(season: str, player_id: int, weights: ScoringWeights):
-    global season_data
-    
     if season not in season_data:
         raise HTTPException(status_code=404, detail="Season data not found")
         
@@ -148,11 +170,17 @@ def get_player_games(season: str, player_id: int, weights: ScoringWeights):
         raise HTTPException(status_code=404, detail="Player not found")
 
     player_df['fantasy_score'] = apply_scoring(player_df, weights.model_dump())
-    
-    result = player_df[['GAME_DATE', 'MIN', 'fantasy_score']].sort_values(by='GAME_DATE', ascending=False)
+
+    stat_cols = ['GAME_DATE', 'GAME_ID', 'MATCHUP', 'WL', 'MIN',
+                 'FGM', 'FGA', 'FG3M', 'FG3A', 'FTM', 'FTA',
+                 'OREB', 'DREB', 'REB', 'AST', 'STL', 'BLK', 'TOV', 'PF', 'PTS',
+                 'fantasy_score']
+    result = player_df[stat_cols].sort_values(by='GAME_DATE', ascending=False)
     
     return result.to_dict(orient="records")
 
+
+# Endpoint 4: All stats and fantasy score for a specific player in a specific game
 class GameDetailRequest(BaseModel):
     player_name: str
     game_id: str
@@ -160,8 +188,6 @@ class GameDetailRequest(BaseModel):
 
 @app.post("/{season}/game/detail")
 def get_game_detail(season: str, req: GameDetailRequest):
-    global season_data
-    
     if season not in season_data:
         raise HTTPException(status_code=404, detail=f"Season '{season}' not found")
         
@@ -177,5 +203,114 @@ def get_game_detail(season: str, req: GameDetailRequest):
     
     to_drop = ['TEAM_ABBREVIATION', 'TEAM_ID']
     result = game_row.drop(columns=[col for col in to_drop if col in game_row.columns])
+
+    row = result.iloc[0]
+    return {
+        k: (int(v.item()) if hasattr(v, 'item') and not isinstance(v, float) else round(float(v), 2) if isinstance(v, float) else v)
+        for k, v in row.items()
+    }
+
+
+
+class PrecisionAuctionConfig(BaseModel):
+    weights: ScoringWeights
+    regular_weeks: int = 20
+    playoff_weeks: int = 4
+    post_season_weightage: float = 1.5
+    num_teams: int = 10
+    roster_size: int = 13
+    total_budget_per_team: float = 200.0
+
+@app.post("/{season}/players/precision-auction-values")
+async def calculate_precision_auction_values(season: str, config: PrecisionAuctionConfig):
+    global season_data
     
-    return result.iloc[0].to_dict()
+    if season not in season_data:
+        raise HTTPException(status_code=404, detail=f"Season '{season}' not found")
+        
+    df = season_data[season].copy()
+    
+    # --- STEP 1: WEEKLY MATCHUP SEGMENTATION ---
+    df['GAME_DATE'] = pd.to_datetime(df['GAME_DATE'])
+    anchor_date = df['GAME_DATE'].min()
+    
+    df['days_elapsed'] = (df['GAME_DATE'] - anchor_date).dt.days
+    df['week_number'] = (df['days_elapsed'] // 7) + 1
+    
+    # Filter for the active fantasy timeline
+    total_fantasy_weeks = config.regular_weeks + config.playoff_weeks
+    df = df[df['week_number'] <= total_fantasy_weeks]
+    
+    # Calculate base fantasy points per game
+    df['base_fp'] = apply_scoring(df, config.weights.model_dump())
+    
+    # Apply post-season weights
+    df['final_fp'] = np.where(
+        df['week_number'] > config.regular_weeks,
+        df['base_fp'] * config.post_season_weightage,
+        df['base_fp']
+    )
+    
+    # --- STEP 2: WEEKLY PLAYER SUMMATION ---
+    # Aggregate points per player, PER WEEK
+    weekly_player_stats = df.groupby(
+        ['week_number', 'PLAYER_ID', 'PLAYER_NAME', 'TEAM_ABBREVIATION']
+    )['final_fp'].sum().reset_index()
+    
+    # --- STEP 3: DYNAMIC WEEKLY REPLACEMENT BASES ---
+    # Determine how many players are starting across the league each week
+    replacement_rank = config.num_teams * config.roster_size
+    
+    weekly_vorp_list = []
+    
+    # Loop through each individual week to find its unique replacement baseline
+    for week in range(1, total_fantasy_weeks + 1):
+        week_df = weekly_player_stats[weekly_player_stats['week_number'] == week].copy()
+        
+        if week_df.empty:
+            continue
+            
+        # Sort top scorers down to lowest scorers for this specific week
+        week_df = week_df.sort_values(by='final_fp', ascending=False).reset_index(drop=True)
+        
+        # Identify the boundary baseline score for this week
+        rep_index = min(replacement_rank, len(week_df) - 1)
+        replacement_baseline_score = week_df.loc[rep_index, 'final_fp']
+        
+        # CRITICAL CHANGE: Calculate VORP and enforce the lower bound floor of 0
+        week_df['weekly_vorp'] = week_df['final_fp'] - replacement_baseline_score
+        week_df['weekly_vorp'] = week_df['weekly_vorp'].clip(lower=0)
+        
+        weekly_vorp_list.append(week_df)
+    
+    # Merge all processed weeks back into one contiguous table
+    processed_weekly_df = pd.concat(weekly_vorp_list, ignore_index=True)
+    
+    # --- STEP 4: SEASONAL AGGREGATION OF WEEKLY VALUE ---
+    # Sum up the non-negative weekly VORP metrics for every player
+    final_player_pool = processed_weekly_df.groupby(
+        ['PLAYER_ID', 'PLAYER_NAME', 'TEAM_ABBREVIATION']
+    ).agg(
+        total_weighted_points=('final_fp', 'sum'),
+        total_accumulated_vorp=('weekly_vorp', 'sum')
+    ).reset_index()
+    
+    # --- STEP 5: PURE ECONOMIC AUCTION VALUATION ---
+    total_league_vorp = final_player_pool['total_accumulated_vorp'].sum()
+    total_league_cash_pool = config.num_teams * config.total_budget_per_team
+    
+    # Direct proportional distribution without artificial baseline floors
+    if total_league_vorp > 0:
+        final_player_pool['auction_value'] = (
+            final_player_pool['total_accumulated_vorp'] / total_league_vorp
+        ) * total_league_cash_pool
+    else:
+        final_player_pool['auction_value'] = 0.0
+        
+    # Formatting adjustments for frontend presentation
+    final_player_pool = final_player_pool.sort_values(by='auction_value', ascending=False).reset_index(drop=True)
+    final_player_pool['auction_value'] = final_player_pool['auction_value'].round(2)
+    final_player_pool['total_weighted_points'] = final_player_pool['total_weighted_points'].round(2)
+    final_player_pool['total_accumulated_vorp'] = final_player_pool['total_accumulated_vorp'].round(2)
+    
+    return final_player_pool.to_dict(orient="records")

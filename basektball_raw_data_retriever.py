@@ -5,7 +5,7 @@ from nba_api.stats.endpoints import leaguegamelog
 
 def collect_nba_data():
     current_dir = Path(__file__).parent
-    file_path = current_dir / "nba_2023_24_gamelogs.parquet"
+    file_path = current_dir / "nba_2022_23_gamelogs.parquet"
 
     custom_headers = {
         'Host': 'stats.nba.com',
@@ -21,7 +21,7 @@ def collect_nba_data():
 
     try:
         log = leaguegamelog.LeagueGameLog(
-            season='2023-24', 
+            season='2022-23', 
             player_or_team_abbreviation='P',
             headers=custom_headers
         )
