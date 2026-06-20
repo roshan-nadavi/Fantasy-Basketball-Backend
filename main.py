@@ -3,6 +3,7 @@ from fastapi.middleware.cors import CORSMiddleware
 import numpy as np
 from pydantic import BaseModel, field_validator
 from datetime import date
+from typing import Literal
 import pandas as pd
 from pathlib import Path
 from contextlib import asynccontextmanager
@@ -44,6 +45,16 @@ def apply_scoring(df_slice: pd.DataFrame, weights: dict) -> pd.Series:
             score += df_slice[stat] * weight
     return score
 
+def paginate(df: pd.DataFrame, limit: int, offset: int) -> dict:
+    total = len(df)
+    paginated = df.iloc[offset: offset + limit]
+    return {
+        "total": total,
+        "offset": offset,
+        "limit": limit,
+        "data": paginated.to_dict(orient="records")
+    }
+
 class ScoringWeights(BaseModel):
     FGM: float = 0.0
     FGA: float = 0.0
@@ -64,7 +75,13 @@ class ScoringWeights(BaseModel):
 
 # Endpoint 1: All players fantasy scores for a season
 @app.post("/{season}/players/fantasy-scores")
-def get_fantasy_scores(season: str, weights: ScoringWeights, limit: int = 50, offset: int = 0):
+def get_fantasy_scores(
+    season: str,
+    weights: ScoringWeights,
+    limit: int = 50,
+    offset: int = 0,
+    sort_by: Literal["total", "avg"] = "total",
+):
     if season not in season_data:
         raise HTTPException(status_code=404, detail="Season data not found")
         
@@ -86,17 +103,12 @@ def get_fantasy_scores(season: str, weights: ScoringWeights, limit: int = 50, of
         avg_fantasy_pts=('CUSTOM_FP', 'mean')
     ).reset_index()
     
-    grouped = grouped.sort_values(by='total_fantasy_pts', ascending=False)
+    sort_col = 'total_fantasy_pts' if sort_by == "total" else 'avg_fantasy_pts'
+    grouped = grouped.sort_values(by=sort_col, ascending=False)
     grouped['total_fantasy_pts'] = grouped['total_fantasy_pts'].round(2)
     grouped['avg_fantasy_pts'] = grouped['avg_fantasy_pts'].round(2)
 
-    paginated = grouped.iloc[offset: offset + limit]
-    return {
-        "total": len(grouped),
-        "offset": offset,
-        "limit": limit,
-        "data": paginated.to_dict(orient="records")
-    }
+    return paginate(grouped, limit, offset)
 
 
 # Endpoint 2: All players fantasy scores for a season filtered by date range
@@ -122,7 +134,13 @@ class DateRangeScoringRequest(BaseModel):
         return v
 
 @app.post("/{season}/players/fantasy-scores/date-range")
-def get_fantasy_scores_by_date(season: str, req: DateRangeScoringRequest, limit: int = 50, offset: int = 0):
+def get_fantasy_scores_by_date(
+    season: str,
+    req: DateRangeScoringRequest,
+    limit: int = 50,
+    offset: int = 0,
+    sort_by: Literal["total", "avg"] = "total",
+):
     if season not in season_data:
         raise HTTPException(status_code=404, detail="Season data not found")
         
@@ -149,22 +167,25 @@ def get_fantasy_scores_by_date(season: str, req: DateRangeScoringRequest, limit:
         avg_fantasy_pts=('CUSTOM_FP', 'mean')
     ).reset_index()
     
-    grouped = grouped.sort_values(by='total_fantasy_pts', ascending=False)
+    sort_col = 'total_fantasy_pts' if sort_by == "total" else 'avg_fantasy_pts'
+    grouped = grouped.sort_values(by=sort_col, ascending=False)
     grouped['total_fantasy_pts'] = grouped['total_fantasy_pts'].round(2)
     grouped['avg_fantasy_pts'] = grouped['avg_fantasy_pts'].round(2)
 
-    paginated = grouped.iloc[offset: offset + limit]
-    return {
-        "total": len(grouped),
-        "offset": offset,
-        "limit": limit,
-        "data": paginated.to_dict(orient="records")
-    }
+    return paginate(grouped, limit, offset)
 
 
 # Endpoint 3: All games for a specific player in a season with fantasy scores
 @app.post("/{season}/player/{player_id}/games")
-def get_player_games(season: str, player_id: int, weights: ScoringWeights):
+def get_player_games(
+    season: str,
+    player_id: int,
+    weights: ScoringWeights,
+    limit: int = 50,
+    offset: int = 0,
+    sort_by: Literal["date", "fantasy_score"] = "date",
+    order: Literal["asc", "desc"] = "desc",
+):
     if season not in season_data:
         raise HTTPException(status_code=404, detail="Season data not found")
         
@@ -181,9 +202,11 @@ def get_player_games(season: str, player_id: int, weights: ScoringWeights):
                  'FGM', 'FGA', 'FG3M', 'FG3A', 'FTM', 'FTA',
                  'OREB', 'DREB', 'REB', 'AST', 'STL', 'BLK', 'TOV', 'PF', 'PTS',
                  'fantasy_score']
-    result = player_df[stat_cols].sort_values(by='GAME_DATE', ascending=False)
+    sort_col = 'GAME_DATE' if sort_by == "date" else 'fantasy_score'
+    ascending = order == "asc"
+    result = player_df[stat_cols].sort_values(by=sort_col, ascending=ascending)
     
-    return result.to_dict(orient="records")
+    return paginate(result, limit, offset)
 
 
 # Endpoint 4: All stats and fantasy score for a specific player in a specific game
@@ -228,7 +251,12 @@ class PrecisionAuctionConfig(BaseModel):
     total_budget_per_team: float = 200.0
 
 @app.post("/{season}/players/precision-auction-values")
-async def calculate_precision_auction_values(season: str, config: PrecisionAuctionConfig):
+async def calculate_precision_auction_values(
+    season: str,
+    config: PrecisionAuctionConfig,
+    limit: int = 50,
+    offset: int = 0,
+):
     global season_data
     
     if season not in season_data:
@@ -336,8 +364,8 @@ async def calculate_precision_auction_values(season: str, config: PrecisionAucti
     mandatory_roster_cost = total_draftable_slots * 1.0
     premium_bidding_pool = total_league_cash_pool - mandatory_roster_cost
 
-    # Initialize the whole pool's values to $0.00
-    final_player_pool['auction_value'] = 0.0
+    # Initialize the whole pool's values to $1.00
+    final_player_pool['auction_value'] = 1.0
 
     # Distribute premium capital based on the linear adjusted VORP share
     if total_league_vorp > 0:
@@ -347,10 +375,14 @@ async def calculate_precision_auction_values(season: str, config: PrecisionAucti
         final_player_pool.loc[:total_draftable_slots - 1, 'auction_value'] = 1.0
         
     # Final formatting adjustments
-    final_player_pool = final_player_pool.sort_values(by='auction_value', ascending=False).reset_index(drop=True)
+    # Primary sort: auction_value desc. Tiebreakers: adjusted_vorp desc, then total_weighted_points desc.
+    final_player_pool = final_player_pool.sort_values(
+        by=['auction_value', 'adjusted_vorp', 'total_weighted_points'],
+        ascending=[False, False, False]
+    ).reset_index(drop=True)
     final_player_pool['auction_value'] = final_player_pool['auction_value'].round(2)
     final_player_pool['total_weighted_points'] = final_player_pool['total_weighted_points'].round(2)
     final_player_pool['total_accumulated_vorp'] = final_player_pool['total_accumulated_vorp'].round(2)
     final_player_pool['adjusted_vorp'] = final_player_pool['adjusted_vorp'].round(2)
     
-    return final_player_pool.to_dict(orient="records")
+    return paginate(final_player_pool, limit, offset)
