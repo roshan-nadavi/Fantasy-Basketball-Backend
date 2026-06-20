@@ -80,7 +80,7 @@ def get_fantasy_scores(season: str, weights: ScoringWeights, limit: int = 50, of
             
     df_logs['CUSTOM_FP'] = custom_scores
     
-    grouped = df_logs.groupby(['PLAYER_ID', 'PLAYER_NAME', 'TEAM_ABBREVIATION']).agg(
+    grouped = df_logs.groupby(['PLAYER_ID', 'PLAYER_NAME']).agg(
         games_played=('GAME_ID', 'count'),
         total_fantasy_pts=('CUSTOM_FP', 'sum'),
         avg_fantasy_pts=('CUSTOM_FP', 'mean')
@@ -143,7 +143,7 @@ def get_fantasy_scores_by_date(season: str, req: DateRangeScoringRequest, limit:
             
     df_filtered['CUSTOM_FP'] = custom_scores
     
-    grouped = df_filtered.groupby(['PLAYER_ID', 'PLAYER_NAME', 'TEAM_ABBREVIATION']).agg(
+    grouped = df_filtered.groupby(['PLAYER_ID', 'PLAYER_NAME']).agg(
         games_played=('GAME_ID', 'count'),
         total_fantasy_pts=('CUSTOM_FP', 'sum'),
         avg_fantasy_pts=('CUSTOM_FP', 'mean')
@@ -277,7 +277,7 @@ async def calculate_precision_auction_values(season: str, config: PrecisionAucti
     
     # --- STEP 2: WEEKLY PLAYER SUMMATION ---
     weekly_player_stats = df.groupby(
-        ['week_number', 'PLAYER_ID', 'PLAYER_NAME', 'TEAM_ABBREVIATION']
+        ['week_number', 'PLAYER_ID', 'PLAYER_NAME']
     )['final_fp'].sum().reset_index()
     
     # --- STEP 3: DYNAMIC WEEKLY REPLACEMENT BASES ---
@@ -306,7 +306,7 @@ async def calculate_precision_auction_values(season: str, config: PrecisionAucti
     
     # --- STEP 4: SEASONAL AGGREGATION OF WEEKLY VALUE ---
     final_player_pool = processed_weekly_df.groupby(
-        ['PLAYER_ID', 'PLAYER_NAME', 'TEAM_ABBREVIATION']
+        ['PLAYER_ID', 'PLAYER_NAME']
     ).agg(
         total_weighted_points=('final_fp', 'sum'),
         total_accumulated_vorp=('weekly_vorp', 'sum')
