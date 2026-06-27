@@ -345,7 +345,7 @@ async def calculate_precision_auction_values(
     final_player_pool = final_player_pool.sort_values(by='total_accumulated_vorp', ascending=False).reset_index(drop=True)
     
     # 2. Find the exact VORP score of the replacement_rank player (e.g. index 129 for a 130-player league)
-    boundary_index = min(total_draftable_slots - 1, len(final_player_pool) - 1)
+    boundary_index = min(total_draftable_slots, len(final_player_pool) - 1)
     seasonal_replacement_vorp = final_player_pool.loc[boundary_index, 'total_accumulated_vorp']
     
     # 3. Subtract that boundary VORP from EVERY player, and clip at 0
@@ -377,7 +377,7 @@ async def calculate_precision_auction_values(
     # Final formatting adjustments
     # Primary sort: auction_value desc. Tiebreakers: adjusted_vorp desc, then total_weighted_points desc.
     final_player_pool = final_player_pool.sort_values(
-        by=['auction_value', 'adjusted_vorp', 'total_weighted_points'],
+        by=['auction_value', 'total_accumulated_vorp', 'total_weighted_points'],
         ascending=[False, False, False]
     ).reset_index(drop=True)
     final_player_pool['auction_value'] = final_player_pool['auction_value'].round(2)
