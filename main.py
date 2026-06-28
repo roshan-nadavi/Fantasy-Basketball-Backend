@@ -21,7 +21,7 @@ async def lifespan(app: FastAPI):
         parts = file_path.stem.split("_")
         
         # Grab just the year segments and join them with an underscore
-        season_key = f"{parts[1]}_{parts[2]}"  # Results in '2025_26'
+        season_key = f"{parts[1]}"  # Results in '2025-26'
         
         season_data[season_key] = pd.read_parquet(file_path)
         print(f"Loaded {season_key}: {len(season_data[season_key])} rows.")
@@ -274,20 +274,42 @@ async def calculate_precision_auction_values(
     df['days_since_monday_anchor'] = (df['GAME_DATE'] - monday_anchor).dt.days
     df['calendar_week'] = (df['days_since_monday_anchor'] // 7) + 1
     
+    # --- STEP 1b: MODULAR ALL-STAR WEEK CONFIGURATION ---
+    # Maps specific seasons to the calendar week containing the All-Star break.
+    # Standard leagues combine this week and the following week into a single match.
+    ALL_STAR_WEEK_MAP = {
+        "2022-23": 18,
+        "2023-24": 17,
+        "2024-25": 17,
+        "2025-26": 17,  # Default or dynamically adjusted based on schedule anchor
+    }
+    
+    # Safely fetch the break week for the current route parameter, defaulting to 17
+    asb_calendar_week = ALL_STAR_WEEK_MAP.get(season, 17)
+    following_week = asb_calendar_week + 1
+
+    # --- STEP 2: WEEKLY PLAYER SUMMATION (Pre-existing grouping) ---
+    # [Your base logic continues here: df['base_fp'] calculation and final_fp weights]
+
+    # --- STEP 3: DYNAMIC WEEKLY REPLACEMENT BASES ---
     # 3. Map Calendar Weeks to Fantasy Weeks to handle the 14-day All-Star Week
     conditions = [
-        df['calendar_week'] <= 16,
-        df['calendar_week'].isin([17, 18]),
-        df['calendar_week'] > 18
+        df['calendar_week'] < asb_calendar_week,
+        df['calendar_week'].isin([asb_calendar_week, following_week]),
+        df['calendar_week'] > following_week
     ]
     
     choices = [
-        df['calendar_week'],
-        17,
-        df['calendar_week'] - 1
+        df['calendar_week'],                # Weeks before the break stay 1:1
+        asb_calendar_week,                  # Both break weeks merge into the anchor week
+        df['calendar_week'] - 1             # Weeks after shift down by 1 to compress the timeline
     ]
     
     df['week_number'] = np.select(conditions, choices, default=1)
+    
+    # Filter for your total active fantasy timeline (Regular + Playoffs)
+    total_fantasy_weeks = config.regular_weeks + config.playoff_weeks
+    df = df[df['week_number'] <= total_fantasy_weeks]
     
     # 4. Filter for your total active fantasy timeline
     total_fantasy_weeks = config.regular_weeks + config.playoff_weeks
